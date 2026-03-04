@@ -1,67 +1,110 @@
 from fastapi import FastAPI, Query
-import requests
 from urllib.parse import urlencode
-import xml.etree.ElementTree as ET
+import requests
+from bs4 import BeautifulSoup
+import re
 
-app = FastAPI(title="LexML SRU Middleware", version="1.0.0")
+app = FastAPI(title="LexML Search Middleware", version="1.1.0")
 
-LEXML_SRU = "https://www.lexml.gov.br/busca/SRU"
+LEXML_SEARCH = "https://www.lexml.gov.br/busca/search"
 
-def _txt(el):
-    return (el.text or "").strip() if el is not None and el.text else None
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
 
 @app.get("/lexml/jurisprudencia")
 def buscar(
     q: str = Query(..., description="Termos (ex: ICMS PIS COFINS base cálculo)"),
-    autoridade: str | None = Query(None, description="Ex: Supremo Tribunal Federal"),
-    start: int = Query(1, ge=1),
+    autoridade: str | None = Query(None, description="Órgão por extenso (ex: Supremo Tribunal Federal)"),
+    start: int = Query(1, ge=1, description="Página (1,2,3...)"),
     limit: int = Query(10, ge=1, le=50),
 ):
-    # Monta CQL simples a partir dos termos
-    termos = [t for t in q.split() if t.strip()]
-    cql = " and ".join([f'dc.description all "{t}"' for t in termos[:8]]) if termos else 'dc.description all ""'
-    cql += ' and facet-tipoDocumento="Jurisprudência"'
+    # 1) Monta URL de busca do LexML (web)
+    # keyword = pesquisa simples
+    # filtros do LexML usam ";f1-<campo>=<valor>" dentro do próprio valor do parâmetro (observado nos links do site)
+    # Exemplo real: ...?doutrinaAutor=...;f1-tipoDocumento=Doutrina  (padrão do LexML)
+    keyword = q
+
+    # Filtra por categoria: Jurisprudência
+    # (no LexML, o filtro aparece como f1-tipoDocumento=<categoria>)
+    keyword_with_filters = f"{keyword};f1-tipoDocumento=Jurisprudência"
+
+    # Se o usuário pediu um órgão (STF/STJ etc.), tentamos filtrar por autoridade emitente
+    # Obs: o nome exato do campo pode variar; este funciona em muitos casos no LexML.
     if autoridade:
-        cql += f' and autoridade all "{autoridade}"'
+        keyword_with_filters += f";f1-autoridadeEmitente={autoridade}"
 
     params = {
-        "operation": "searchRetrieve",
-        "version": "1.1",
-        "query": cql,
-        "startRecord": start,
-        "maximumRecords": limit,
-        "recordPacking": "xml",
+        "keyword": keyword_with_filters,
+        # paginação simples: muitos ambientes usam 'page'; se não funcionar, ainda retorna página 1
+        "page": str(start),
     }
-    url = f"{LEXML_SRU}?{urlencode(params)}"
 
-    r = requests.get(url, headers={"Accept": "application/xml"}, timeout=20)
-    r.raise_for_status()
+    url = f"{LEXML_SEARCH}?{urlencode(params)}"
 
-    root = ET.fromstring(r.text)
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    # Se o LexML mudar e devolver erro, devolvemos detalhe em JSON (sem 500 “cego”)
+    if r.status_code >= 400:
+        return {
+            "context": {"q": q, "autoridade": autoridade, "url": url},
+            "error": {"status_code": r.status_code, "body_snippet": r.text[:300]},
+            "results": []
+        }
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # 2) Captura links /urn/ (normalmente são os resultados)
+    urn_links = [a.get("href") for a in soup.find_all("a", href=True) if "/urn/" in a.get("href")]
+    # Normaliza URLs relativas
+    urn_links = [("https://www.lexml.gov.br" + h) if h.startswith("/") else h for h in urn_links]
+
+    # 3) Extrai texto e quebra por itens ("Adicionar" aparece no bloco do resultado)
+    text = soup.get_text("\n", strip=True)
+    parts = re.split(r"\n\d+\s+Adicionar\n", "\n" + text)
 
     results = []
-    for rec in root.findall(".//{*}record"):
-        data = rec.find(".//{*}recordData")
-        if data is None:
-            continue
+    link_idx = 0
 
-        title = _txt(data.find(".//{*}title"))
-        date = _txt(data.find(".//{*}date"))
-        descs = [d.text.strip() for d in data.findall(".//{*}description") if d is not None and d.text]
+    for chunk in parts[1:]:
+        # pega só um pedaço por item
+        lines = [l.strip() for l in chunk.split("\n") if l.strip()]
+        # heurísticas de campos que o LexML costuma mostrar:
+        # Tipo, Autoridade, Título, Data, Ementa, Assuntos
+        def pick(label: str):
+            for i, ln in enumerate(lines):
+                if ln.startswith(label):
+                    # casos "Label  valor"
+                    val = ln[len(label):].strip(" :")
+                    if val:
+                        return _clean(val)
+                    # ou valor na próxima linha
+                    if i + 1 < len(lines):
+                        return _clean(lines[i+1])
+            return None
 
-        ids = [i.text.strip() for i in data.findall(".//{*}identifier") if i is not None and i.text]
-        urn = next((i for i in ids if i.startswith("urn:")), None)
-        link = f"https://www.lexml.gov.br/urn/{urn}" if urn else None
+        tipo = pick("Tipo")
+        autoridade_txt = pick("Autoridade") or pick("Autoridade Emitente")
+        titulo = pick("Título")
+        data = pick("Data")
+        ementa = pick("Ementa")
+        assuntos = pick("Assuntos")
+
+        url_item = urn_links[link_idx] if link_idx < len(urn_links) else None
+        link_idx += 1
 
         results.append({
-            "title": title,
-            "date": date,
-            "descriptions": descs,
-            "urn": urn,
-            "url": link,
+            "title": titulo,
+            "date": data,
+            "tipo": tipo,
+            "autoridade": autoridade_txt,
+            "ementa": ementa,
+            "assuntos": assuntos,
+            "url": url_item,
         })
 
+        if len(results) >= limit:
+            break
+
     return {
-        "context": {"q": q, "autoridade": autoridade, "cql": cql, "start": start, "limit": limit},
-        "results": results,
+        "context": {"q": q, "autoridade": autoridade, "url": url},
+        "results": results
     }
