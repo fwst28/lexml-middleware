@@ -4,7 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 
-app = FastAPI(title="LexML Search Middleware", version="1.1.2")
+app = FastAPI(title="LexML Search Middleware", version="1.1.3")
 
 LEXML_SEARCH = "https://www.lexml.gov.br/busca/search"
 
@@ -18,25 +18,35 @@ def _startdoc_from_page(page: int, page_size: int = 20) -> int:
     return (page - 1) * page_size + 1
 
 
-def _grab_block_field(block: str, label: str) -> str | None:
+def _grab_field(block: str, label: str) -> str | None:
     """
-    Extrai o conteúdo após um rótulo em um bloco de texto do LexML.
-    Ex.: "Autoridade  Superior Tribunal de Justiça. 1ª Seção"
+    Extrai um campo rotulado dentro do bloco.
+    Observação: "Localidade" costuma vir como "1 Localidade  <valor>Adicionar",
+    então tratamos esse rótulo de forma especial.
     """
-    m = re.search(rf"\n\s*{re.escape(label)}\s+(.*?)(?=\n\s*(?:Localidade|Autoridade|Título|Data|Ementa|URN|Assuntos)\s|\Z)",
-                  block, flags=re.S)
+    if label == "Localidade":
+        # Captura "1 Localidade  Distrito FederalAdicionar"
+        m = re.search(r"\n\s*\d+\s+Localidade\s+(.*?)(?:Adicionar|\n)", block, flags=re.S)
+        return _clean(m.group(1)) if m else None
+
+    # Para os demais rótulos, a linha costuma ser " Autoridade  ...", " Título ...", etc.
+    m = re.search(
+        rf"\n\s*{re.escape(label)}\s+(.*?)(?=\n\s*(?:Localidade|Autoridade|Título|Data|Ementa|URN|Assuntos)\s|\Z)",
+        block,
+        flags=re.S
+    )
     return _clean(m.group(1)) if m else None
 
 
 @app.get("/lexml/jurisprudencia")
 def buscar(
-    q: str = Query(..., description="Termos (ex: ICMS PIS COFINS base cálculo)"),
-    autoridade: str | None = Query(None, description="Filtro textual (ex: Supremo Tribunal Federal)"),
+    q: str = Query(..., description="Termos (ex: dano moral negativacao indevida)"),
+    autoridade: str | None = Query(None, description="Filtro textual (ex: Superior Tribunal de Justiça)"),
     start: int = Query(1, ge=1, description="Página (1,2,3...)"),
     limit: int = Query(10, ge=1, le=50),
 ):
-    # 1) Monta URL de busca do LexML (web) da forma estável:
-    # keyword=<termos>&f1-tipoDocumento=Jurisprudência
+    # Monta URL de busca do LexML (web) do jeito que funciona bem:
+    # keyword=<termos>&f1-tipoDocumento=Jurisprudência ;startDoc=<n>
     params = {
         "keyword": q,
         "f1-tipoDocumento": "Jurisprudência",
@@ -54,11 +64,9 @@ def buscar(
         }
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # 2) Extrai o texto “visível” da página
     text = soup.get_text("\n", strip=True)
 
-    # 3) Quebra por itens: cada resultado começa com "<número> Localidade"
+    # Cada item começa com "<número> Localidade"
     blocks = re.split(r"\n(?=\d+\s+Localidade\s)", "\n" + text)
 
     results = []
@@ -67,12 +75,12 @@ def buscar(
         if not re.search(r"\n\d+\s+Localidade\s", block):
             continue
 
-        localidade = _grab_block_field(block, "Localidade")
-        autoridade_txt = _grab_block_field(block, "Autoridade")
-        titulo = _grab_block_field(block, "Título")
-        data = _grab_block_field(block, "Data")
+        localidade = _grab_field(block, "Localidade")
+        autoridade_txt = _grab_field(block, "Autoridade") or _grab_field(block, "Autoridade Emitente")
+        titulo = _grab_field(block, "Título")
+        data = _grab_field(block, "Data")
 
-        # Ementa pode ser longa: pega do rótulo "Ementa" até "URN" ou "Assuntos"
+        # Ementa: do rótulo "Ementa" até "URN" ou "Assuntos"
         m_ementa = re.search(r"\n\s*Ementa\s+(.*?)(?=\n\s*(?:URN|Assuntos)\s|\Z)", block, flags=re.S)
         ementa = _clean(m_ementa.group(1)) if m_ementa else None
 
@@ -96,7 +104,7 @@ def buscar(
             "url": url_item,
         }
 
-        # 4) Filtro por autoridade (pós-processamento, mais estável)
+        # Filtro por autoridade (pós-processamento)
         if autoridade:
             if not (autoridade_txt and autoridade.lower() in autoridade_txt.lower()):
                 continue
