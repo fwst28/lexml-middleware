@@ -4,16 +4,29 @@ import requests
 from bs4 import BeautifulSoup
 import re
 
-app = FastAPI(title="LexML Search Middleware", version="1.1.1")
+app = FastAPI(title="LexML Search Middleware", version="1.1.2")
 
 LEXML_SEARCH = "https://www.lexml.gov.br/busca/search"
+
 
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
+
 def _startdoc_from_page(page: int, page_size: int = 20) -> int:
-    # LexML usa startDoc=1 na primeira página e incrementa ~20 por página (ex.: 21 na pág. 2). :contentReference[oaicite:1]{index=1}
+    # LexML usa startDoc=1 na primeira página e incrementa ~20 por página (ex.: 21 na pág. 2).
     return (page - 1) * page_size + 1
+
+
+def _grab_block_field(block: str, label: str) -> str | None:
+    """
+    Extrai o conteúdo após um rótulo em um bloco de texto do LexML.
+    Ex.: "Autoridade  Superior Tribunal de Justiça. 1ª Seção"
+    """
+    m = re.search(rf"\n\s*{re.escape(label)}\s+(.*?)(?=\n\s*(?:Localidade|Autoridade|Título|Data|Ementa|URN|Assuntos)\s|\Z)",
+                  block, flags=re.S)
+    return _clean(m.group(1)) if m else None
+
 
 @app.get("/lexml/jurisprudencia")
 def buscar(
@@ -22,73 +35,60 @@ def buscar(
     start: int = Query(1, ge=1, description="Página (1,2,3...)"),
     limit: int = Query(10, ge=1, le=50),
 ):
-    # 1) Monta URL de busca do LexML (web) do jeito que o site usa:
+    # 1) Monta URL de busca do LexML (web) da forma estável:
     # keyword=<termos>&f1-tipoDocumento=Jurisprudência
     params = {
         "keyword": q,
         "f1-tipoDocumento": "Jurisprudência",
     }
 
-    # Paginação via startDoc (o LexML usa ;startDoc=21 etc.) :contentReference[oaicite:2]{index=2}
     startDoc = _startdoc_from_page(start, page_size=20)
     url = f"{LEXML_SEARCH}?{urlencode(params)};startDoc={startDoc}"
 
-    r = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30
-    )
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     if r.status_code >= 400:
         return {
             "context": {"q": q, "autoridade": autoridade, "url": url},
-            "error": {"status_code": r.status_code, "body_snippet": r.text[:300]},
+            "error": {"status_code": r.status_code, "body_snippet": r.text[:400]},
             "results": []
         }
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Links de URN (resultados)
-    urn_links = [a.get("href") for a in soup.find_all("a", href=True) if "/urn/" in a.get("href")]
-    urn_links = [("https://www.lexml.gov.br" + h) if h.startswith("/") else h for h in urn_links]
-
-    # Quebra por itens ("Adicionar" aparece nos blocos)
+    # 2) Extrai o texto “visível” da página
     text = soup.get_text("\n", strip=True)
-    parts = re.split(r"\n\d+\s+Localidade\s+.*?Adicionar\n", "\n" + text)
+
+    # 3) Quebra por itens: cada resultado começa com "<número> Localidade"
+    blocks = re.split(r"\n(?=\d+\s+Localidade\s)", "\n" + text)
 
     results = []
-    link_idx = 0
 
-    def pick(lines, label: str):
-        for i, ln in enumerate(lines):
-            if ln.startswith(label):
-                val = ln[len(label):].strip(" :")
-                if val:
-                    return _clean(val)
-                if i + 1 < len(lines):
-                    return _clean(lines[i + 1])
-        return None
+    for block in blocks:
+        if not re.search(r"\n\d+\s+Localidade\s", block):
+            continue
 
-    for chunk in parts[1:]:
-        lines = [l.strip() for l in chunk.split("\n") if l.strip()]
+        localidade = _grab_block_field(block, "Localidade")
+        autoridade_txt = _grab_block_field(block, "Autoridade")
+        titulo = _grab_block_field(block, "Título")
+        data = _grab_block_field(block, "Data")
 
-        tipo = pick(lines, "Tipo")
-        autoridade_txt = pick(lines, "Autoridade") or pick(lines, "Autoridade Emitente")
-        titulo = pick(lines, "Título")
-        data = pick(lines, "Data")
-        ementa = pick(lines, "Ementa")
-        assuntos = pick(lines, "Assuntos")
-        urn = pick(lines, "URN")
+        # Ementa pode ser longa: pega do rótulo "Ementa" até "URN" ou "Assuntos"
+        m_ementa = re.search(r"\n\s*Ementa\s+(.*?)(?=\n\s*(?:URN|Assuntos)\s|\Z)", block, flags=re.S)
+        ementa = _clean(m_ementa.group(1)) if m_ementa else None
 
-        # URL (preferir URN link; se não existir, monta pelo URN textual)
-        url_item = urn_links[link_idx] if link_idx < len(urn_links) else None
-        link_idx += 1
-        if not url_item and urn:
-            url_item = f"https://www.lexml.gov.br/urn/{urn}"
+        # URN (formato típico urn:lex:...)
+        m_urn = re.search(r"\n\s*URN\s+(urn:lex:[^\s]+)", block)
+        urn = m_urn.group(1) if m_urn else None
+
+        m_assuntos = re.search(r"\n\s*Assuntos\s+(.*?)(?=\n\s*\d+\s+Localidade\s|\Z)", block, flags=re.S)
+        assuntos = _clean(m_assuntos.group(1)) if m_assuntos else None
+
+        url_item = f"https://www.lexml.gov.br/urn/{urn}" if urn else None
 
         item = {
             "title": titulo,
             "date": data,
-            "tipo": tipo,
+            "localidade": localidade,
             "autoridade": autoridade_txt,
             "ementa": ementa,
             "assuntos": assuntos,
@@ -96,7 +96,7 @@ def buscar(
             "url": url_item,
         }
 
-        # 2) Filtro por autoridade (pós-processamento, mais estável)
+        # 4) Filtro por autoridade (pós-processamento, mais estável)
         if autoridade:
             if not (autoridade_txt and autoridade.lower() in autoridade_txt.lower()):
                 continue
