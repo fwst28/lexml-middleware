@@ -1,16 +1,16 @@
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Path
 from fastapi.openapi.utils import get_openapi
 from urllib.parse import urlencode
 import requests
 from bs4 import BeautifulSoup
 import re
 import unicodedata
+import time
 
 PUBLIC_BASE_URL = "https://lexml-middleware.onrender.com"
 LEXML_SEARCH = "https://www.lexml.gov.br/busca/search"
 
-# ⬆️ aumente a versão sempre que publicar mudanças para conferir no /docs
-app = FastAPI(title="LexML Search Middleware", version="2.1.0")
+app = FastAPI(title="LexML Search Middleware", version="2.2.0")
 
 
 # ✅ FORÇA "servers" no OpenAPI (resolve o erro do GPT Builder)
@@ -24,7 +24,6 @@ def custom_openapi():
         description="Middleware para pesquisa de jurisprudência no LexML (via HTML)",
         routes=app.routes,
     )
-
     schema["servers"] = [{"url": PUBLIC_BASE_URL}]
     app.openapi_schema = schema
     return app.openapi_schema
@@ -74,49 +73,14 @@ AUTH_ALIASES = {
 }
 
 
-def _authority_patterns(user_value: str) -> list[str]:
-    """
-    Retorna padrões (normalizados) para checar autoridade.
-    Aceita: "stj", "STJ", "Superior Tribunal de Justiça", etc.
-    """
-    v = _norm(user_value)
-    if not v:
-        return []
-
-    if v in AUTH_ALIASES:
-        return AUTH_ALIASES[v]
-
-    pats = [v]
-
-    # adiciona aliases comuns quando detectar o nome por extenso
-    if "superior tribunal de justica" in v:
-        pats.append("stj")
-    if "supremo tribunal federal" in v:
-        pats.append("stf")
-    if "tribunal superior do trabalho" in v:
-        pats.append("tst")
-    if "tribunal superior eleitoral" in v:
-        pats.append("tse")
-    if "tribunal de contas da uniao" in v:
-        pats.append("tcu")
-
-    # remove duplicados preservando ordem
-    return list(dict.fromkeys([p for p in pats if p]))
-
-
 def _startdoc_from_page(page: int, page_size: int = 20) -> int:
-    # página 1 -> 1 ; página 2 -> 21 ; página 3 -> 41 ...
     return (page - 1) * page_size + 1
 
 
 def _field(block: str, labels: list[str]) -> str | None:
-    """
-    Extrai valor para rótulos do LexML a partir do texto "visível" (soup.get_text).
-    """
     stop = r"(?:Localidade|Autoridade|Título|Titulo|Data|Ementa|URN|Assuntos)"
     for label in labels:
         if label.lower() == "localidade":
-            # Ex.: "1 Localidade  Distrito FederalAdicionar"
             m = re.search(r"\n\s*\d+\s+Localidade\s+(.*?)(?:Adicionar|\n)", block, flags=re.S)
             if m:
                 return _clean(m.group(1))
@@ -132,15 +96,11 @@ def _field(block: str, labels: list[str]) -> str | None:
     return None
 
 
-@app.get("/lexml/jurisprudencia")
-def buscar(
-    q: str = Query(...),
-    autoridade: str | None = Query(None),
-    start: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=50),
-    debug: int = Query(0),
-):
-    # ✅ Montagem correta: keyword é só texto; filtro vai em parâmetro separado
+def _search_lexml(q: str, start: int, limit: int, patterns: list[str] | None, debug: int):
+    """
+    Busca no LexML (HTML) e retorna resultados.
+    patterns: lista de padrões normalizados para filtrar por tribunal (pós-processamento).
+    """
     params = {
         "keyword": q,
         "f1-tipoDocumento": "Jurisprudência",
@@ -148,46 +108,39 @@ def buscar(
     startDoc = _startdoc_from_page(start, page_size=20)
     url = f"{LEXML_SEARCH}?{urlencode(params)};startDoc={startDoc}"
 
-    # Padrões para filtro de autoridade (normalizado e tolerante)
-    patterns = _authority_patterns(autoridade) if autoridade else []
-
-    # Limita varredura para evitar timeout quando filtro exige “pular” muitos resultados
-    MAX_BLOCKS = 250  # ajuste 150–400 conforme comportamento no Render
+    # Limites para evitar timeout no Actions
+    MAX_BLOCKS = 220
+    MAX_SECONDS = 6.0
+    t0 = time.time()
 
     try:
         r = requests.get(
             url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept-Language": "pt-BR,pt;q=0.9",
-            },
-            timeout=(10, 30),  # (connect, read)
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt;q=0.9"},
+            timeout=(8, 18),
         )
     except Exception as e:
-        return {
-            "context": {"q": q, "autoridade": autoridade, "url": url},
-            "error": {"type": "request_failed", "message": str(e)},
-            "results": [],
-        }
+        return {"context": {"q": q, "url": url}, "error": {"type": "request_failed", "message": str(e)}, "results": []}
 
     if r.status_code >= 400:
-        return {
-            "context": {"q": q, "autoridade": autoridade, "url": url},
-            "error": {"type": "http_error", "status_code": r.status_code, "body_snippet": r.text[:600]},
-            "results": [],
-        }
+        return {"context": {"q": q, "url": url}, "error": {"type": "http_error", "status_code": r.status_code}, "results": []}
 
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n", strip=True)
 
     blocks = re.split(r"\n(?=\d+\s+)", "\n" + text)
     urn_pat = re.compile(r"\bURN\s+(urn:lex:[^\s]+)")
-    results = []
 
+    results = []
     scanned = 0
+    stopped_by_time = False
+
     for block in blocks:
         scanned += 1
         if scanned > MAX_BLOCKS:
+            break
+        if (time.time() - t0) > MAX_SECONDS:
+            stopped_by_time = True
             break
 
         m_urn = urn_pat.search(block)
@@ -205,45 +158,80 @@ def buscar(
         m_ementa = re.search(r"\n\s*Ementa\s+(.*?)(?=\n\s*(?:URN|Assuntos)\s|\Z)", block, flags=re.S)
         ementa = _clean(m_ementa.group(1)) if m_ementa else None
 
-        # ✅ Filtro de autoridade robusto (normaliza acentos, aceita alias)
+        # Filtro por tribunal (robusto): tenta em Autoridade; se vazio, tenta no bloco
         if patterns:
-            at_norm = _norm(autoridade_txt or "")
-            if not any(p in at_norm for p in patterns):
+            hay = _norm(autoridade_txt or "")
+            if not hay:
+                hay = _norm(block[:700])
+            if not any(p in hay for p in patterns):
                 continue
 
-        results.append(
-            {
-                "title": titulo,
-                "date": data,
-                "autoridade": autoridade_txt,
-                "ementa": ementa,
-                "assuntos": assuntos,
-                "urn": urn,
-                "url": url_item,
-            }
-        )
+        results.append({
+            "title": titulo,
+            "date": data,
+            "autoridade": autoridade_txt,
+            "ementa": ementa,
+            "assuntos": assuntos,
+            "urn": urn,
+            "url": url_item,
+        })
 
         if len(results) >= limit:
             break
 
-    response = {"context": {"q": q, "autoridade": autoridade, "url": url}, "results": results}
+    resp = {"context": {"q": q, "url": url}, "results": results}
 
-    # Aviso de varredura parcial quando filtro ativo pode exigir mais “pulos”
-    if patterns and scanned > MAX_BLOCKS and len(results) < limit:
-        response["warning"] = {
-            "type": "partial_scan",
-            "message": "Filtro de autoridade pode exigir varrer mais resultados; limitei a varredura para evitar timeout.",
+    if patterns and (scanned >= MAX_BLOCKS or stopped_by_time) and len(results) < limit:
+        resp["warning"] = {
+            "message": "Filtro por tribunal pode exigir varrer muitos resultados; limitei a varredura para evitar timeout.",
             "scanned_blocks": scanned,
             "max_blocks": MAX_BLOCKS,
+            "stopped_by_time": stopped_by_time,
+            "elapsed_seconds": round(time.time() - t0, 3),
         }
 
     if not results and debug == 1:
-        response["debug"] = {
+        resp["debug"] = {
             "urn_count_in_page_text": len(urn_pat.findall(text)),
             "text_preview": text[:1200],
             "blocks_count": len(blocks),
             "scanned_blocks": scanned,
-            "authority_patterns": patterns,
+            "patterns": patterns,
+            "stopped_by_time": stopped_by_time,
+            "elapsed_seconds": round(time.time() - t0, 3),
         }
 
-    return response
+    return resp
+
+
+# ✅ Endpoint SEM filtro (sempre funcionou bem)
+@app.get("/lexml/jurisprudencia")
+def buscar_geral(
+    q: str = Query(...),
+    start: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50),
+    debug: int = Query(0),
+):
+    return _search_lexml(q=q, start=start, limit=limit, patterns=None, debug=debug)
+
+
+# ✅ Endpoint COM filtro por tribunal via PATH (mais estável no Actions)
+@app.get("/lexml/jurisprudencia/{tribunal}")
+def buscar_por_tribunal(
+    tribunal: str = Path(..., description="Use: stj, stf, tst, tse, tcu"),
+    q: str = Query(...),
+    start: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50),
+    debug: int = Query(0),
+):
+    t = _norm(tribunal)
+    patterns = AUTH_ALIASES.get(t)
+    if not patterns:
+        return {
+            "context": {"q": q, "tribunal": tribunal},
+            "error": {"type": "invalid_tribunal", "message": "Use um destes: stj, stf, tst, tse, tcu"},
+            "results": []
+        }
+    resp = _search_lexml(q=q, start=start, limit=limit, patterns=patterns, debug=debug)
+    resp["context"]["tribunal"] = tribunal
+    return resp
